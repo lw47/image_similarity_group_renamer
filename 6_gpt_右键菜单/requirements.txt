@@ -1,0 +1,4 @@
+numpy
+Pillow
+scipy
+ascii-art-python==2.1.1

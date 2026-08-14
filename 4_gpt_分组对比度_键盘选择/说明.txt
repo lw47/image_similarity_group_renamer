@@ -1,0 +1,6 @@
+修正版5
+
+修复：
+1. Treeview tag_configure 不再错误传入 rowheight，解决 Tkinter TclError。
+2. 分隔行高度通过 Treeview style 设置。
+3. 保留前一版的纯空白分隔行、图片键盘上下切换、右侧预览和终端日志。
