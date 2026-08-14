@@ -5,6 +5,8 @@ import math
 import threading
 import queue
 import traceback
+import sqlite3
+import pickle
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
@@ -20,7 +22,8 @@ SUPPORTED = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif', '.tif', '.tiff'}
 SCRIPT_DIR = Path(__file__).resolve().parent
 LAST_FOLDER_FILE = SCRIPT_DIR / 'last_folder.txt'
 
-
+CACHE_DB = SCRIPT_DIR / '.image_similarity_cache.db'
+CACHE_VERSION = 1
 REQUIREMENTS_FILE = SCRIPT_DIR / 'requirements.txt'
 REQUIREMENTS_CONTENT = """numpy
 Pillow
@@ -29,16 +32,147 @@ scipy
 
 
 def ensure_requirements_file():
-    """Generate requirements.txt beside the script on first launch if missing."""
     try:
         if not REQUIREMENTS_FILE.exists():
             REQUIREMENTS_FILE.write_text(REQUIREMENTS_CONTENT, encoding='utf-8')
             log(f'首次启动：已生成 requirements.txt: {REQUIREMENTS_FILE}')
-        else:
-            log(f'已检测 requirements.txt: {REQUIREMENTS_FILE}')
     except Exception:
-        log('生成/读取 requirements.txt 失败:')
+        log('生成 requirements.txt 失败:')
         traceback.print_exc()
+
+
+class FeatureCache:
+    def __init__(self):
+        self.conn = sqlite3.connect(str(CACHE_DB), timeout=30)
+        self.conn.execute('PRAGMA journal_mode=WAL')
+        self.conn.execute('PRAGMA synchronous=NORMAL')
+        self.conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        self.conn.execute("""CREATE TABLE IF NOT EXISTS features (
+            path TEXT PRIMARY KEY,
+            size INTEGER NOT NULL,
+            mtime_ns INTEGER NOT NULL,
+            feature BLOB NOT NULL,
+            updated_at TEXT NOT NULL
+        )""")
+        row = self.conn.execute('SELECT value FROM meta WHERE key=?', ('version',)).fetchone()
+        if row is None or row[0] != str(CACHE_VERSION):
+            self.conn.execute('DELETE FROM features')
+            self.conn.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)', ('version', str(CACHE_VERSION)))
+            self.conn.commit()
+
+    def get(self, path):
+        st = path.stat()
+        row = self.conn.execute(
+            'SELECT size, mtime_ns, feature FROM features WHERE path=?',
+            (str(path.resolve()),)
+        ).fetchone()
+        if row and row[0] == st.st_size and row[1] == st.st_mtime_ns:
+            try:
+                return pickle.loads(row[2])
+            except Exception:
+                return None
+        return None
+
+    def put(self, path, feature):
+        st = path.stat()
+        blob = sqlite3.Binary(pickle.dumps(feature, protocol=pickle.HIGHEST_PROTOCOL))
+        self.conn.execute(
+            'INSERT OR REPLACE INTO features(path,size,mtime_ns,feature,updated_at) VALUES(?,?,?,?,?)',
+            (str(path.resolve()), st.st_size, st.st_mtime_ns, blob, datetime.now().isoformat(timespec='seconds'))
+        )
+
+    def cleanup(self):
+        rows = self.conn.execute('SELECT path FROM features').fetchall()
+        stale = [(r[0],) for r in rows if not Path(r[0]).exists()]
+        if stale:
+            self.conn.executemany('DELETE FROM features WHERE path=?', stale)
+            log(f'清理不存在的缓存: {len(stale)} 条')
+
+    def commit(self):
+        self.conn.commit()
+
+    def close(self):
+        try:
+            self.conn.commit()
+        finally:
+            self.conn.close()
+
+
+def _phash_buckets(bits):
+    value = 0
+    for i, bit in enumerate(bits):
+        if bool(bit):
+            value |= (1 << i)
+    keys = []
+    for block in range(8):
+        chunk = (value >> (block * 8)) & 0xFF
+        keys.append((block, chunk))
+        for bit in range(8):
+            keys.append((block, chunk ^ (1 << bit)))
+    return keys
+
+
+def _dhash_buckets(bits):
+    value = 0
+    for i, bit in enumerate(bits):
+        if bool(bit):
+            value |= (1 << i)
+    return [((value >> (block * 16)) & 0xFFFF, block) for block in range(16)]
+
+
+def build_candidate_pairs(items):
+    """Use pHash/dHash LSH buckets plus aspect-ratio buckets to reduce pair comparisons."""
+    n = len(items)
+    total_pairs = n * (n - 1) // 2
+    if n < 500:
+        return [(i, j) for i in range(n) for j in range(i + 1, n)], total_pairs, 'exact'
+
+    p_index = {}
+    d_index = {}
+    for i, (_path, feat) in enumerate(items):
+        ratio = feat.get('ratio', 1.0)
+        rb = int(round(math.log(max(ratio, 1e-6)) / 0.20))
+        for block, key in _phash_buckets(feat['p']):
+            p_index.setdefault((rb, block, key), set()).add(i)
+        for key, block in _dhash_buckets(feat['d']):
+            d_index.setdefault((rb, block, key), set()).add(i)
+
+    pairs = set()
+    for i, (_path, feat) in enumerate(items):
+        ratio = feat.get('ratio', 1.0)
+        rb = int(round(math.log(max(ratio, 1e-6)) / 0.20))
+        candidates = set()
+        for rbin in (rb - 1, rb, rb + 1):
+            for block, key in _phash_buckets(feat['p']):
+                candidates.update(p_index.get((rbin, block, key), ()))
+            for key, block in _dhash_buckets(feat['d']):
+                candidates.update(d_index.get((rbin, block, key), ()))
+        candidates.discard(i)
+        for j in candidates:
+            if i < j:
+                pairs.add((i, j))
+            elif j < i:
+                pairs.add((j, i))
+
+    # A small exact fallback for images that got no LSH candidate.
+    ratio_buckets = {}
+    for i, (_path, feat) in enumerate(items):
+        rb = int(round(math.log(max(feat.get('ratio', 1.0), 1e-6)) / 0.20))
+        ratio_buckets.setdefault(rb, []).append(i)
+    covered = set()
+    for a, b in pairs:
+        covered.add(a)
+        covered.add(b)
+    isolated = [i for i in range(n) if i not in covered]
+    for i in isolated:
+        rb = int(round(math.log(max(items[i][1].get('ratio', 1.0), 1e-6)) / 0.20))
+        cohort = ratio_buckets.get(rb, [])
+        # Compare only a deterministic subset when the same-ratio cohort is huge.
+        for j in cohort[:80]:
+            if i != j:
+                pairs.add((i, j) if i < j else (j, i))
+
+    return sorted(pairs), total_pairs, 'lsh'
 
 
 def log(msg):
@@ -140,18 +274,19 @@ def make_groups(items, threshold, progress=None):
         if ra != rb:
             parent[rb] = ra
 
-    total = n * (n - 1) // 2
-    done = 0
-    for i in range(n):
+    candidate_pairs, total_pairs, mode = build_candidate_pairs(items)
+    reduction = (1.0 - len(candidate_pairs) / max(1, total_pairs)) * 100.0
+    log(f'候选索引: mode={mode}, 全部比较={total_pairs:,}, 候选比较={len(candidate_pairs):,}, 减少={reduction:.1f}%')
+
+    total_candidates = len(candidate_pairs)
+    for done, (i, j) in enumerate(candidate_pairs, 1):
         fi = items[i][1]
-        for j in range(i + 1, n):
-            fj = items[j][1]
-            if abs(math.log((fi['ratio'] + 1e-6) / (fj['ratio'] + 1e-6))) <= 1.2:
-                if similarity(fi, fj) >= threshold:
-                    union(i, j)
-            done += 1
-            if progress and (done == total or done % max(1, total // 100) == 0):
-                progress(done / max(1, total))
+        fj = items[j][1]
+        if abs(math.log((fi['ratio'] + 1e-6) / (fj['ratio'] + 1e-6))) <= 1.2:
+            if similarity(fi, fj) >= threshold:
+                union(i, j)
+        if progress and (done == total_candidates or done % max(1, total_candidates // 100) == 0):
+            progress(done / max(1, total_candidates))
 
     groups = defaultdict(list)
     for i, (path, feat) in enumerate(items):
@@ -168,7 +303,6 @@ def make_groups(items, threshold, progress=None):
 
     result.sort(key=lambda g: g[0][0].name.lower())
     return result
-
 
 def build_plan(groups, prefix='Group'):
     rows = []
@@ -205,7 +339,6 @@ class App(tk.Tk):
 
     def __init__(self):
         super().__init__()
-        ensure_requirements_file()
         self.title('图片相似度分组与重命名')
         self.geometry('1200x760')
         self.minsize(1000, 650)
@@ -382,15 +515,31 @@ class App(tk.Tk):
                 return
 
             items = []
-            for i, p in enumerate(paths):
-                try:
-                    with Image.open(p) as im:
-                        im.load()
-                        feat = visual_feature(im)
-                    items.append((p, feat))
-                except Exception as e:
-                    log(f'跳过无法读取的图片: {p} ; {e}')
-                self.q.put(('status', (i + 1) / len(paths), f'读取图片 {i + 1}/{len(paths)}'))
+            cache_hits = 0
+            cache_misses = 0
+            cache = FeatureCache()
+            try:
+                cache.cleanup()
+                for i, p in enumerate(paths):
+                    try:
+                        feat = cache.get(p)
+                        if feat is not None:
+                            cache_hits += 1
+                        else:
+                            cache_misses += 1
+                            with Image.open(p) as im:
+                                im.load()
+                                feat = visual_feature(im)
+                            cache.put(p, feat)
+                        items.append((p, feat))
+                    except Exception as e:
+                        log(f'跳过无法读取的图片: {p} ; {e}')
+                    self.q.put(('status', (i + 1) / len(paths), f'读取图片 {i + 1}/{len(paths)}；缓存命中 {cache_hits}'))
+                cache.commit()
+            finally:
+                cache.close()
+
+            log(f'特征缓存统计: 命中={cache_hits}, 重新计算={cache_misses}, 总计={len(items)}')
 
             if not items:
                 self.q.put(('error', '图片无法读取。'))
@@ -918,6 +1067,7 @@ class App(tk.Tk):
 
 if __name__ == '__main__':
     log('========== 图片相似度分组工具启动 ==========')
+    ensure_requirements_file()
     try:
         app = App()
         app.mainloop()
