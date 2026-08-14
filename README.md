@@ -1,1 +1,2 @@
 # image_similarity_group_renamer
+按图片相似度将文件夹内的图片进行分组、重命名
